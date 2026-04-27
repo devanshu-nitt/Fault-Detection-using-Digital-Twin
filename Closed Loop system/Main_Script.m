@@ -135,22 +135,22 @@ save(fullfile(targetFolder,'tank_models.mat'), ...
 disp('✅ tank_models.mat saved');
 
 %% =========================================================
-%  SCRIPT 1B (FIXED): FAULTY DATA → IMPROVED FAULT CLASSIFIER
-%  Fix: Windowed residual statistics to separate Drift vs Stuck
+%  SCRIPT 1B (FIXED v3): h_meas as twin history (matches 1A training)
 %% =========================================================
 clc; clear; close all;
 
-%% ---- LOAD TWIN + CONTROLLER ----
-ld      = load('E:\MATLAB File\Closed Loop system\tank_models.mat');
+%% ---- LOAD ----
+ld       = load('E:\MATLAB File\Closed Loop system\tank_models.mat');
 net_twin = ld.net_twin; Xps = ld.Xps; Yps = ld.Yps;
-K_lqr   = ld.K_lqr;    h0  = ld.h0;  u0  = ld.u0;
-seq_len = ld.seq_len;
+K_lqr    = ld.K_lqr;   h0  = ld.h0;  u0  = ld.u0;
+seq_len  = ld.seq_len;
 
 %% ---- PARAMETERS ----
 A1=615.75; A2=615.75; A3=615.75;
 a12=5.0671; a23=5.0671; a3=5.0671;
 beta12=0.9; beta23=0.8; beta3=0.3;
 k1=75; k2=75; dt=0.5;
+H_MAX = 100;   % physical tank height limit (cm)
 
 function u_eq = getUeq_B(h_ref,beta12,a12,beta23,a23,beta3,a3,k1,k2)
     F12e = beta12*a12*sqrt(max(h_ref(1)-h_ref(2),0));
@@ -159,41 +159,34 @@ function u_eq = getUeq_B(h_ref,beta12,a12,beta23,a23,beta3,a3,k1,k2)
     u_eq = [F12e/k1; max((F3e-F23e)/k2,0)];
 end
 
-%% ---- SIMULATION SETTINGS ----
-T    = 2400;
-time = 0:dt:T;
-Nsim = length(time);
-
+%% ---- INIT ----
+T    = 2400; time = 0:dt:T; Nsim = length(time);
 h_plant = h0;
-h_pred  = h0;
-h_hist  = repmat(h0, 1, seq_len);
+
+% ── Twin history: CLEAN measurements (matches Script 1A training) ──
+h_hist  = repmat(h0, 1, seq_len);   % will be filled with h_meas
 
 h_ref = h0;
 u_eq  = getUeq_B(h_ref,beta12,a12,beta23,a23,beta3,a3,k1,k2);
 
-%% ---- SLIDING WINDOW BUFFER for residuals ----
-%  We keep last W residuals to compute mean/std/slope
-W          = 20;                          % window length (~10 s at dt=0.5)
-res_buffer = zeros(3, W);                 % 3 tanks × W steps
-
-%% ---- PRE-ALLOCATE RAW DATA STORE ----
-% Columns: [t | u_plant(2) | h_pred(3) | h_faulty(3) | residual(3) |
-%           res_mean(3) | res_std(3) | res_slope(3) | fault_type]
-%  Total = 1+2+3+3+3+3+3+3+1 = 22 columns
-data_f = zeros(Nsim, 22);
+W          = 20;
+res_buffer = zeros(3, W);
+data_f     = zeros(Nsim, 22);
 
 for i = 1:Nsim
     t = time(i);
 
-    %% --- FAULT SCHEDULE ---
-    if     t > 300  && t <= 900,   fault_type = 1;   % Bias   h1  (+10 cm, abrupt)
-    elseif t > 900  && t <= 1500,  fault_type = 2;   % Drift  h2  (slow ramp)
-    elseif t > 1500 && t <= 2100,  fault_type = 3;   % Stuck  h3  (frozen at 20)
-    else,                          fault_type = 0;   % Normal
+    %% Fault schedule
+    if     t > 300  && t <= 900,   fault_type = 1;   % Bias h1
+    elseif t > 900  && t <= 1500,  fault_type = 2;   % Drift h2
+    elseif t > 1500 && t <= 2100,  fault_type = 3;   % Stuck h3
+    else,                          fault_type = 0;
     end
 
-    %% --- PLANT: LQR uses FAULTY sensor ---
+    %% Clean sensor (noise only, no fault)
     h_meas   = h_plant + 0.05*randn(3,1);
+
+    %% Faulty sensor (what LQR and classifier see)
     h_faulty = h_meas;
     switch fault_type
         case 1,  h_faulty(1) = h_faulty(1) + 10;
@@ -201,44 +194,50 @@ for i = 1:Nsim
         case 3,  h_faulty(3) = 20;
     end
 
+    %% Plant controller (uses FAULTY sensor)
     u_plant = max(u_eq - K_lqr*(h_faulty - h_ref), 0);
 
+    %% Advance nonlinear plant with physical clamp
     h1=h_plant(1); h2=h_plant(2); h3=h_plant(3);
-    F12 = beta12*a12*sqrt(max(h1-h2,0));
-    F23 = beta23*a23*sqrt(max(h2-h3,0));
-    F3  = beta3*a3  *sqrt(max(h3,0));
-    dh  = [(k1*u_plant(1)-F12)/A1;
-            (F12-F23)/A2;
-            (F23-F3+k2*u_plant(2))/A3];
-    h_plant = max(h_plant + dt*dh, 0);
+    F12=beta12*a12*sqrt(max(h1-h2,0));
+    F23=beta23*a23*sqrt(max(h2-h3,0));
+    F3 =beta3*a3  *sqrt(max(h3,0));
+    dh = [(k1*u_plant(1)-F12)/A1;
+          (F12-F23)/A2;
+          (F23-F3+k2*u_plant(2))/A3];
+    h_plant = min(max(h_plant + dt*dh, 0), H_MAX);  % ← physical clamp
 
-    %% --- DIGITAL TWIN: uses own clean estimate ---
-    u_twin = max(u_eq - K_lqr*(h_pred - h_ref), 0);
+    %% =====================================================
+    %  DIGITAL TWIN — FIXED:
+    %  Use h_meas (clean sensor) as input history.
+    %  This EXACTLY matches how Script 1A built training data.
+    %  → twin tracks plant correctly → residual ≈ 0 in Normal.
+    %% =====================================================
+    h_hist = [h_meas, h_hist(:, 1:end-1)];   % ← h_meas, NOT h_pred
 
-    h_hist = [h_pred, h_hist(:, 1:end-1)];
-    x_in   = [u_twin(1); u_twin(2);
-               h_hist(1,:)'; h_hist(2,:)'; h_hist(3,:)'];
+    x_in   = [u_plant(1); u_plant(2);
+               h_hist(1,:)';
+               h_hist(2,:)';
+               h_hist(3,:)'];                  % 17×1
+
     x_norm = mapminmax('apply', x_in, Xps);
     y_norm = net_twin(x_norm);
-    h_pred = mapminmax('reverse', y_norm, Yps);
+    h_pred = mapminmax('reverse', y_norm, Yps);  % one-step-ahead prediction
 
-    %% --- RESIDUAL & SLIDING WINDOW STATISTICS ---
-    residual = h_pred - h_faulty;           % 3×1, instantaneous
+    %% Residual: predicted (clean) vs reported (possibly faulty)
+    residual = h_pred - h_faulty;             % ≈ 0 in Normal, ≠ 0 during faults
 
-    % Roll buffer (newest at column 1)
+    %% Windowed statistics
     res_buffer = [residual, res_buffer(:, 1:end-1)];
+    res_mean   = mean(res_buffer, 2);
+    res_std    = std(res_buffer,  0, 2);
 
-    % Only compute stats once buffer has filled (first W steps use zeros — OK for classifier)
-    res_mean  = mean(res_buffer, 2);        % 3×1
-    res_std   = std(res_buffer, 0, 2);      % 3×1
+    x_idx   = (1:W)';
+    x_mean  = mean(x_idx);
+    denom   = sum((x_idx - x_mean).^2);
+    res_slope = (res_buffer * (x_idx - x_mean)) / denom;
 
-    % Slope: fit linear trend over window using least-squares (fast 1-D)
-    x_idx  = (1:W)';
-    x_mean = mean(x_idx);
-    denom  = sum((x_idx - x_mean).^2);
-    res_slope = ((res_buffer * (x_idx - x_mean)) / denom);  % 3×1
-
-    %% --- STORE ---
+    %% Store
     data_f(i,:) = [t, u_plant(1), u_plant(2), ...
                    h_pred(1),    h_pred(2),    h_pred(3), ...
                    h_faulty(1),  h_faulty(2),  h_faulty(3), ...
@@ -249,17 +248,18 @@ for i = 1:Nsim
                    fault_type];
 end
 
-%% ---- BUILD FEATURE MATRIX ----
-% Features (18 total):
-%   h_twin(3)  | h_faulty(3)  | residual(3) |
-%   res_mean(3)| res_std(3)   | res_slope(3)
-%
-% res_slope is the KEY discriminator:
-%   Normal  → slope ≈ 0,  std small
-%   Bias    → slope ≈ 0,  large mean on h1
-%   Drift   → slope > 0 (growing), std large on h2
-%   Stuck   → slope ≈ 0,  large mean on h3, std small
+%% ---- DIAGNOSTIC: residuals should be small in Normal ----
+fprintf('\n--- Residual sanity check ---\n');
+for c = 0:3
+    idx = data_f(:,22) == c;
+    names = {'Normal','Bias h1','Drift h2','Stuck h3'};
+    fprintf('%-10s | h1: %6.3f  h2: %6.3f  h3: %6.3f\n', names{c+1}, ...
+        mean(abs(data_f(idx,10))), ...
+        mean(abs(data_f(idx,11))), ...
+        mean(abs(data_f(idx,12))));
+end
 
+%% ---- FEATURE MATRIX ----
 h_twin_cols   = data_f(:, 4:6);
 h_faulty_cols = data_f(:, 7:9);
 res_inst      = data_f(:, 10:12);
@@ -271,75 +271,62 @@ fault_labels  = data_f(:, 22);
 X_f = [h_twin_cols, h_faulty_cols, res_inst, ...
        res_mean_cols, res_std_cols, res_slp_cols]';   % 18 × N
 
-% Discard first W transient rows (buffer warm-up)
-X_f        = X_f(:, W+1:end);
+X_f               = X_f(:, W+1:end);
 fault_labels_trim = fault_labels(W+1:end);
 
-%% ---- NORMALISE INPUT FEATURES ----
 [X_fn, Xfps] = mapminmax(X_f);
+Y_oh = full(ind2vec(fault_labels_trim' + 1));
 
-%% ---- ONE-HOT ENCODE LABELS ----
-Y_oh = full(ind2vec(fault_labels_trim' + 1));      % 4 × N
-
-%% ---- TRAIN IMPROVED FAULT CLASSIFIER ----
-%  Larger network + trainscg + softmax output (patternnet default)
+%% ---- TRAIN CLASSIFIER ----
 net_fault = patternnet([32 16 8]);
-net_fault.trainFcn = 'trainscg';
-net_fault.performFcn = 'crossentropy';
-net_fault.divideParam.trainRatio = 0.70;
-net_fault.divideParam.valRatio   = 0.15;
-net_fault.divideParam.testRatio  = 0.15;
-net_fault.trainParam.epochs      = 500;
-net_fault.trainParam.min_grad    = 1e-7;
+net_fault.trainFcn                = 'trainscg';
+net_fault.performFcn              = 'crossentropy';
+net_fault.divideParam.trainRatio  = 0.70;
+net_fault.divideParam.valRatio    = 0.15;
+net_fault.divideParam.testRatio   = 0.15;
+net_fault.trainParam.epochs       = 500;
+net_fault.trainParam.min_grad     = 1e-7;
 net_fault = train(net_fault, X_fn, Y_oh);
 
 %% ---- EVALUATE ----
 Y_pred_f     = net_fault(X_fn);
 Y_pred_class = vec2ind(Y_pred_f) - 1;
-
 acc = sum(Y_pred_class' == fault_labels_trim) / length(fault_labels_trim);
-fprintf('\n✅ Fault classifier accuracy: %.2f%%\n', acc*100);
-
-% Per-class accuracy
+fprintf('\n✅ Accuracy: %.2f%%\n', acc*100);
+names_ev = {'Normal','Bias h1','Drift h2','Stuck h3'};
 for c = 0:3
     idx = fault_labels_trim == c;
     if any(idx)
         ca = sum(Y_pred_class(idx)' == fault_labels_trim(idx)) / sum(idx);
-        names = {'Normal','Bias h1','Drift h2','Stuck h3'};
-        fprintf('   Class %d (%s): %.2f%%\n', c, names{c+1}, ca*100);
+        fprintf('   Class %d (%s): %.2f%%\n', c, names_ev{c+1}, ca*100);
     end
 end
 
 %% ---- PLOTS ----
 figure; plotconfusion(Y_oh, Y_pred_f);
-title('Confusion Matrix – Improved Classifier');
+title('Confusion Matrix – v3 Fixed');
 
-figure;
 t_trim = data_f(W+1:end, 1);
-plot(t_trim, fault_labels_trim, 'b', 'LineWidth', 2); hold on;
-plot(t_trim, Y_pred_class', 'r--', 'LineWidth', 1.5);
-legend('Actual','Predicted'); xlabel('Time (s)'); ylabel('Fault Class');
-title('Fault Detection – Improved (Windowed Features)'); grid on;
-ylim([-0.2 3.2]);
-
-% Residual statistics diagnostic plot
 figure;
-subplot(3,1,1);
-plot(t_trim, res_slp_cols(W+1:end, :));
-title('Residual Slope (KEY: Drift has slope≠0, Stuck/Bias have slope≈0)');
-legend('h1','h2','h3'); xlabel('Time (s)'); grid on;
+plot(t_trim, fault_labels_trim,  'b',   'LineWidth', 2); hold on;
+plot(t_trim, Y_pred_class',      'r--', 'LineWidth', 1.5);
+legend('Actual','Predicted'); xlabel('Time (s)'); ylabel('Fault Class');
+title('Fault Detection (h\_meas as twin history)'); grid on; ylim([-0.2 3.2]);
 
-subplot(3,1,2);
-plot(t_trim, res_std_cols(W+1:end, :));
-title('Residual Std (Drift has growing std)');
+% Residual diagnostic
+figure;
+subplot(3,1,1); plot(data_f(:,1), data_f(:,10:12));
+title('Instantaneous Residuals — should be ~0 in Normal windows');
 legend('h1','h2','h3'); xlabel('Time (s)'); grid on;
+xline(300,'k--','300'); xline(900,'k--','900');
+xline(1500,'k--','1500'); xline(2100,'k--','2100');
 
-subplot(3,1,3);
-plot(t_trim, res_mean_cols(W+1:end, :));
-title('Residual Mean (Bias/Stuck have large mean)');
-legend('h1','h2','h3'); xlabel('Time (s)'); grid on;
+subplot(3,1,2); plot(t_trim, res_slp_cols(W+1:end,:));
+title('Residual Slope'); legend('h1','h2','h3'); xlabel('Time (s)'); grid on;
+
+subplot(3,1,3); plot(t_trim, res_mean_cols(W+1:end,:));
+title('Residual Mean'); legend('h1','h2','h3'); xlabel('Time (s)'); grid on;
 
 %% ---- SAVE ----
-save('E:\MATLAB File\Closed Loop system\fault_models.mat', ...
-     'net_fault', 'Xfps', 'W');
+save('E:\MATLAB File\Closed Loop system\fault_models.mat','net_fault','Xfps','W');
 disp('✅ fault_models.mat saved');
